@@ -340,6 +340,8 @@ public final class QuickJS implements AutoCloseable {
         void run(long handle, long callId);
     }
 
+    private record BindingKey(long object, String name) {}
+
     private record AsyncBinding(AsyncFunction function, Supplier<AsyncScope> capture) {}
 
     private static final AtomicInteger NEXT_RUNTIME = new AtomicInteger();
@@ -353,7 +355,8 @@ public final class QuickJS implements AutoCloseable {
     private final Map<Integer, AsyncBinding> asyncFunctions = new HashMap<>();
     private final Map<Long, AsyncCall> asyncCalls = new HashMap<>();
     private Map<Long, CompletableFuture<Object>> asyncOwners = Map.of();
-    private final Map<String, Integer> bindings = new HashMap<>();
+    private final Map<BindingKey, Integer> bindings = new HashMap<>();
+    private final Set<String> modules = new HashSet<>();
     private final Set<CompletableFuture<?>> submissions = new HashSet<>();
     private final ArrayList<Runnable> closeHooks = new ArrayList<>();
     private final CompletableFuture<Void> destroyed = new CompletableFuture<>();
@@ -441,6 +444,15 @@ public final class QuickJS implements AutoCloseable {
         return call((handle, callId) -> evaluate(handle, callId, source, name, true));
     }
 
+    public CompletableFuture<Object> evaluateModule(String source, String name,
+            Consumer<CompletableFuture<Object>> before, Runnable after) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(before, "before");
+        Objects.requireNonNull(after, "after");
+        return call((handle, callId) -> evaluate(handle, callId, source, name, true), before, after, false);
+    }
+
     public CompletableFuture<Object> invoke(String objectName, String method, Object... args) {
         Objects.requireNonNull(objectName, "objectName");
         Objects.requireNonNull(method, "method");
@@ -477,8 +489,40 @@ public final class QuickJS implements AutoCloseable {
         return call((handle, callId) -> invoke(handle, callId, objectName, method, values), before, after, false, timeoutMillis);
     }
 
+    public CompletableFuture<Object> invoke(Reference object, String method, Object... args) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(method, "method");
+        Object[] values = Objects.requireNonNull(args, "args").clone();
+        return call((handle, callId) -> invokeObject(handle, callId, object, method, values));
+    }
+
+    public CompletableFuture<Object> invoke(Reference object, String method,
+            Consumer<CompletableFuture<Object>> before, Runnable after, Object... args) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(method, "method");
+        Objects.requireNonNull(before, "before");
+        Objects.requireNonNull(after, "after");
+        Object[] values = Objects.requireNonNull(args, "args").clone();
+        return call((handle, callId) -> invokeObject(handle, callId, object, method, values), before, after, false);
+    }
+
+    public CompletableFuture<Void> registerModule(String name, Reference exports) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(exports, "exports");
+        return submit(() -> {
+            if (modules.contains(name)) throw new IllegalStateException("Module is already registered: " + name);
+            registerModule(handle, name, exports);
+            modules.add(name);
+            return null;
+        });
+    }
+
     public CompletableFuture<Void> bind(String name, Function function) {
-        return bind(name, function, false);
+        return bind(null, name, function, false);
+    }
+
+    public CompletableFuture<Void> bind(Reference object, String name, Function function) {
+        return bind(Objects.requireNonNull(object, "object"), name, function, false);
     }
 
     /** Binds a Java future as a JavaScript Promise without changing synchronous bind. */
@@ -494,6 +538,18 @@ public final class QuickJS implements AutoCloseable {
      * Context is independent of cancellation owners and can outlive its birth call.
      */
     public CompletableFuture<Void> bindAsync(String name, AsyncFunction function, Supplier<AsyncScope> capture) {
+        return bindAsyncFunction(null, name, function, capture);
+    }
+
+    public CompletableFuture<Void> bindAsync(Reference object, String name, AsyncFunction function) {
+        return bindAsync(object, name, function, () -> () -> () -> {});
+    }
+
+    public CompletableFuture<Void> bindAsync(Reference object, String name, AsyncFunction function, Supplier<AsyncScope> capture) {
+        return bindAsyncFunction(Objects.requireNonNull(object, "object"), name, function, capture);
+    }
+
+    private CompletableFuture<Void> bindAsyncFunction(Reference object, String name, AsyncFunction function, Supplier<AsyncScope> capture) {
         if (isOwnerThread() && reportingRejection) return failedFuture(new IllegalStateException("JavaScript reentry from a rejection listener"));
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(function, "function");
@@ -502,8 +558,9 @@ public final class QuickJS implements AutoCloseable {
             int id = ++nextFunctionId;
             asyncFunctions.put(id, new AsyncBinding(function, capture));
             try {
-                bindAsync(handle, name, id);
-                bindings.put(name, id);
+                if (object == null) bindAsync(handle, name, id);
+                else bindObject(handle, object, name, id, true, false);
+                bindings.put(bindingKey(object, name), id);
             } catch (Throwable error) {
                 asyncFunctions.remove(id);
                 throw error;
@@ -514,10 +571,14 @@ public final class QuickJS implements AutoCloseable {
 
     /** Binds a host function whose object arguments retain their JavaScript identity. */
     public CompletableFuture<Void> bindReference(String name, Function function) {
-        return bind(name, function, true);
+        return bind(null, name, function, true);
     }
 
-    private CompletableFuture<Void> bind(String name, Function function, boolean references) {
+    public CompletableFuture<Void> bindReference(Reference object, String name, Function function) {
+        return bind(Objects.requireNonNull(object, "object"), name, function, true);
+    }
+
+    private CompletableFuture<Void> bind(Reference object, String name, Function function, boolean references) {
         if (isOwnerThread() && reportingRejection) return failedFuture(new IllegalStateException("JavaScript reentry from a rejection listener"));
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(function, "function");
@@ -525,8 +586,9 @@ public final class QuickJS implements AutoCloseable {
             int id = ++nextFunctionId;
             functions.put(id, function);
             try {
-                bind(handle, name, id, references);
-                bindings.put(name, id);
+                if (object == null) bind(handle, name, id, references);
+                else bindObject(handle, object, name, id, false, references);
+                bindings.put(bindingKey(object, name), id);
             } catch (Throwable error) {
                 functions.remove(id);
                 throw error;
@@ -538,8 +600,23 @@ public final class QuickJS implements AutoCloseable {
     /** Releases the host registration after its JavaScript binding has been removed. */
     public CompletableFuture<Void> releaseBinding(String name) {
         Objects.requireNonNull(name, "name");
+        return releaseBinding(new BindingKey(0, name));
+    }
+
+    public CompletableFuture<Void> releaseBinding(Reference object, String name) {
+        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(name, "name");
+        return releaseBinding(bindingKey(object, name));
+    }
+
+    private BindingKey bindingKey(Reference object, String name) {
+        if (object != null && object.runtime != this) throw new IllegalArgumentException("Reference belongs to another runtime");
+        return new BindingKey(object == null ? 0 : object.id, name);
+    }
+
+    private CompletableFuture<Void> releaseBinding(BindingKey key) {
         return schedule(() -> {
-            Integer id = bindings.remove(name);
+            Integer id = bindings.remove(key);
             if (id != null) {
                 functions.remove(id);
                 asyncFunctions.remove(id);
@@ -1338,6 +1415,7 @@ public final class QuickJS implements AutoCloseable {
             functions.clear();
             asyncFunctions.clear();
             bindings.clear();
+            modules.clear();
             moduleLoader = null;
             asyncScopeCapture = null;
             detachedJobScope = null;
@@ -1369,6 +1447,8 @@ public final class QuickJS implements AutoCloseable {
 
     private native void invoke(long handle, long callId, String objectName, String method, Object[] args);
 
+    private native void invokeObject(long handle, long callId, Reference object, String method, Object[] args);
+
     private native void callFunction(long handle, long callId, Reference function, Object receiver, Object[] args);
 
     private native void callback(long handle, long callId, long callbackId, Object[] args, boolean detached);
@@ -1376,6 +1456,10 @@ public final class QuickJS implements AutoCloseable {
     private native void bind(long handle, String name, int functionId, boolean references);
 
     private native void bindAsync(long handle, String name, int functionId);
+
+    private native void bindObject(long handle, Reference object, String name, int functionId, boolean async, boolean references);
+
+    private native void registerModule(long handle, String name, Reference exports);
 
     private native long[] scope(long handle);
 
